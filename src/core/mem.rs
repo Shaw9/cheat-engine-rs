@@ -30,6 +30,9 @@ impl Display for MemoryError {
     }
 }
 
+impl std::error::Error for MemoryError {}
+
+
 #[derive(Debug)]
 pub struct MemoryRegion {
     pub start: u64,
@@ -157,8 +160,7 @@ pub fn get_memory_regions(
         let mut range_split = range.split('-');
         let start_str = range_split.next().ok_or_else(|| MemoryError::MemRead(0))?;
         let end_str = range_split.next().ok_or_else(|| MemoryError::MemRead(0))?;
-        let start_addr_val =
-            u64::from_str_radix(start_str, 16).map_err(|_| MemoryError::MemRead(0))?;
+        let start_addr_val = u64::from_str_radix(start_str, 16).map_err(|_| MemoryError::MemRead(0))?;
         let end_addr_val = u64::from_str_radix(end_str, 16).map_err(|_| MemoryError::MemRead(0))?;
 
         // Filter by address range
@@ -189,6 +191,100 @@ pub fn get_memory_regions(
                 perms: region_perms,
             });
         }
+    }
+
+    Ok(regions)
+}
+
+#[cfg(target_os = "windows")]
+pub fn get_memory_regions(
+    pid: u32,
+    start: Option<u64>,
+    end: Option<u64>,
+    search_perms: Option<&[MemoryRegionPerms]>,
+) -> Result<Vec<MemoryRegion>, MemoryError> {
+    use windows::Win32::System::Threading::OpenProcess;
+    use windows::Win32::System::Threading::PROCESS_QUERY_INFORMATION;
+    use windows::Win32::System::Threading::PROCESS_VM_READ;
+    use windows::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE_WRITECOPY};
+
+    let search_perms = search_perms.unwrap_or(&DEFAULT_SEARCH_PERMS);
+    let start_addr = start.unwrap_or(0);
+    let end_addr = end.unwrap_or(u64::MAX);
+
+    // Open the process with necessary permissions
+    let process_handle = unsafe {
+        OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
+    };
+
+    let process_handle = process_handle.map_err(|_| MemoryError::NoPermission(0))?;
+
+    if process_handle.is_invalid() {
+        return Err(MemoryError::NoPermission(0));
+    }
+
+    let mut regions = Vec::new();
+    let mut current_address: u64 = 0;
+
+    loop {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        let result = unsafe {
+            VirtualQueryEx(
+                process_handle,
+                Some(current_address as *const _),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>()
+            )
+        };
+
+        if result == 0 {
+            break;
+        }
+
+        let region_start = mbi.BaseAddress as u64;
+        let region_end = region_start + mbi.RegionSize as u64;
+
+        // Filter by address range
+        if region_end < start_addr || region_start > end_addr {
+            current_address = region_end;
+            continue;
+        }
+
+        // Check if the region is accessible
+        if mbi.State == MEM_COMMIT {
+            let mut region_perms = Vec::with_capacity(2);
+
+            // Check read permission
+            if (mbi.Protect & PAGE_READONLY) != PAGE_PROTECTION_FLAGS(0) ||
+               (mbi.Protect & PAGE_READWRITE) != PAGE_PROTECTION_FLAGS(0) ||
+               (mbi.Protect & PAGE_EXECUTE_READ) != PAGE_PROTECTION_FLAGS(0) ||
+               (mbi.Protect & PAGE_EXECUTE_READWRITE) != PAGE_PROTECTION_FLAGS(0) {
+                region_perms.push(MemoryRegionPerms::Read);
+            }
+
+            // Check write permission
+            if (mbi.Protect & PAGE_READWRITE) != PAGE_PROTECTION_FLAGS(0) ||
+               (mbi.Protect & PAGE_EXECUTE_READWRITE) != PAGE_PROTECTION_FLAGS(0) ||
+               (mbi.Protect & PAGE_WRITECOPY) != PAGE_PROTECTION_FLAGS(0) ||
+               (mbi.Protect & PAGE_EXECUTE_WRITECOPY) != PAGE_PROTECTION_FLAGS(0) {
+                region_perms.push(MemoryRegionPerms::Write);
+            }
+
+            if search_perms
+                .iter()
+                .filter(|p| region_perms.contains(p))
+                .count()
+                > 0
+            {
+                regions.push(MemoryRegion {
+                    start: region_start,
+                    end: region_end,
+                    perms: region_perms,
+                });
+            }
+        }
+
+        current_address = region_end;
     }
 
     Ok(regions)

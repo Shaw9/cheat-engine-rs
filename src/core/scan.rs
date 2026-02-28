@@ -101,6 +101,15 @@ impl std::fmt::Display for ScanError {
     }
 }
 
+impl std::error::Error for ScanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Memory(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 impl ScanResult {
     pub fn new(
         address: u64,
